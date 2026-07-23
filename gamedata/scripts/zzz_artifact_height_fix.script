@@ -1,0 +1,842 @@
+local STABLE_VERSION = "1.0.0"
+local ARTIFACT_HEIGHT_ABOVE_SURFACE = 1.0
+local SURFACE_HEIGHT_TOLERANCE = 0.1
+local FLOOR_SEARCH_DEPTH = 12.0
+local GROUND_CHECK_DEPTH = 3.0
+local LEVEL_BOUND_MARGIN = 16.0
+local STATIC_GEOMETRY_RAY_FLAGS = 2
+local INVALID_LEVEL_VERTEX_ID = 4294967295
+local FREE_PARENT_ID = 65535
+local MAX_SERVER_OBJECT_ID = 65534
+local ARTIFACT_REPAIR_DELAY = 1500
+local ARTIFACT_STATE_CHECK_INTERVAL = 500
+local ARTIFACT_READINESS_TIMEOUT = 15000
+local ARTIFACT_STABILITY_DELAY = 3000
+local ARTIFACT_SETTLING_DELAY = 1500
+
+local RAY_OFFSETS = {
+	0.25, 0.5, 0.75, 1.0,
+	1.5, 2.0, 3.0, 4.0,
+	6.0, 8.0, 12.0, 16.0,
+	24.0, 32.0, 48.0, 64.0,
+	96.0, 128.0, 192.0, 256.0,
+	384.0, 512.0,
+}
+
+local callbacks_registered = false
+local static_ray_object = nil
+local level_minimum_height = nil
+local level_maximum_height = nil
+local artifact_repair_time = nil
+local artifact_repair_deadline = nil
+local pending_artifact_ids = nil
+local pending_online_artifact_ids = nil
+local artifact_ids_stable_since = nil
+local tracked_artifact_states = nil
+local tracked_artifact_check_time = nil
+
+local function reset_loading_state()
+	static_ray_object = nil
+	level_minimum_height = nil
+	level_maximum_height = nil
+	artifact_repair_time = nil
+	artifact_repair_deadline = nil
+	pending_artifact_ids = nil
+	pending_online_artifact_ids = nil
+	artifact_ids_stable_since = nil
+end
+
+local function reset_repair_state()
+	reset_loading_state()
+	tracked_artifact_states = nil
+	tracked_artifact_check_time = nil
+end
+
+local function get_coordinates(position)
+	if not position then
+		return nil
+	end
+
+	local call_succeeded, position_x, position_y, position_z =
+		pcall(function()
+			return position.x, position.y, position.z
+		end)
+	if not call_succeeded then
+		return nil
+	end
+
+	return position_x, position_y, position_z
+end
+
+local function get_position_height(position)
+	local _, position_height = get_coordinates(position)
+	return position_height
+end
+
+local function get_object_height(game_object)
+	if not game_object then
+		return nil
+	end
+
+	local call_succeeded, object_position = pcall(function()
+		return game_object:position()
+	end)
+	return call_succeeded and get_position_height(object_position) or nil
+end
+
+local function get_static_ray()
+	if static_ray_object then
+		return static_ray_object
+	end
+
+	if type(ray_pick) ~= "function" and type(ray_pick) ~= "userdata" then
+		return nil
+	end
+
+	local call_succeeded, ray_object = pcall(ray_pick)
+	if not call_succeeded or not ray_object then
+		return nil
+	end
+
+	call_succeeded = pcall(function()
+		ray_object:set_direction(vector():set(0, -1, 0))
+		ray_object:set_flags(STATIC_GEOMETRY_RAY_FLAGS)
+	end)
+	if not call_succeeded then
+		return nil
+	end
+
+	static_ray_object = ray_object
+	return static_ray_object
+end
+
+local function get_level_height_bounds()
+	if level_minimum_height and level_maximum_height then
+		return level_minimum_height, level_maximum_height
+	end
+
+	local call_succeeded, bounding_volume = pcall(function()
+		return level.get_bounding_volume()
+	end)
+	if not call_succeeded or not bounding_volume then
+		return nil
+	end
+
+	call_succeeded, level_minimum_height, level_maximum_height =
+		pcall(function()
+			return get_position_height(bounding_volume.min),
+				get_position_height(bounding_volume.max)
+		end)
+	if not call_succeeded
+		or not level_minimum_height
+		or not level_maximum_height
+	then
+		level_minimum_height = nil
+		level_maximum_height = nil
+		return nil
+	end
+
+	return level_minimum_height, level_maximum_height
+end
+
+local function get_server_artifact_position(server_object)
+	local game_object = level.object_by_id(server_object.id)
+	if game_object then
+		local call_succeeded, object_position = pcall(function()
+			return game_object:position()
+		end)
+		if call_succeeded and object_position then
+			return object_position
+		end
+	end
+
+	return server_object.position
+end
+
+local function find_top_surface_height(position_x, position_z)
+	local ray_object = get_static_ray()
+	if not ray_object then
+		return nil
+	end
+
+	local minimum_height, maximum_height = get_level_height_bounds()
+	if not minimum_height or not maximum_height then
+		return nil
+	end
+
+	local start_height = maximum_height + LEVEL_BOUND_MARGIN
+	local ray_range = start_height
+		- (minimum_height - LEVEL_BOUND_MARGIN)
+	local ray_origin = vector():set(
+		position_x,
+		start_height,
+		position_z
+	)
+
+	local query_succeeded, hit_surface, hit_distance =
+		pcall(function()
+			ray_object:set_position(ray_origin)
+			ray_object:set_range(ray_range)
+			if not ray_object:query() then
+				return false
+			end
+			return true, ray_object:get_distance()
+		end)
+
+	if not query_succeeded or not hit_surface or not hit_distance then
+		return nil
+	end
+
+	return start_height - hit_distance
+end
+
+local function find_surface_height(
+	position_x,
+	position_z,
+	reference_height
+)
+	local ray_object = get_static_ray()
+	if not ray_object then
+		return nil
+	end
+
+	local ray_origin = vector()
+	for offset_index = 1, #RAY_OFFSETS do
+		local ray_offset = RAY_OFFSETS[offset_index]
+		local start_height = reference_height + ray_offset
+
+		local query_succeeded, hit_surface, hit_distance =
+			pcall(function()
+				ray_object:set_position(
+					ray_origin:set(position_x, start_height, position_z)
+				)
+				ray_object:set_range(FLOOR_SEARCH_DEPTH + ray_offset)
+				if not ray_object:query() then
+					return false
+				end
+				return true, ray_object:get_distance()
+			end)
+
+		if query_succeeded and hit_surface and hit_distance then
+			return start_height - hit_distance
+		end
+	end
+
+	return nil
+end
+
+local function has_nearby_surface_below(
+	position_x,
+	position_z,
+	position_height
+)
+	local ray_object = get_static_ray()
+	if not ray_object then
+		return false
+	end
+
+	local start_height = position_height + SURFACE_HEIGHT_TOLERANCE
+	local ray_origin = vector():set(
+		position_x,
+		start_height,
+		position_z
+	)
+	local query_succeeded, hit_surface = pcall(function()
+		ray_object:set_position(ray_origin)
+		ray_object:set_range(
+			GROUND_CHECK_DEPTH + SURFACE_HEIGHT_TOLERANCE
+		)
+		return ray_object:query()
+	end)
+
+	return query_succeeded and hit_surface
+end
+
+local function create_valid_level_position(
+	position_x,
+	position_y,
+	position_z,
+	fallback_vertex_id
+)
+	local corrected_position =
+		vector():set(position_x, position_y, position_z)
+	local corrected_vertex_id = level.vertex_id(corrected_position)
+	if not corrected_vertex_id
+		or corrected_vertex_id >= INVALID_LEVEL_VERTEX_ID
+	then
+		if not fallback_vertex_id
+			or fallback_vertex_id >= INVALID_LEVEL_VERTEX_ID
+		then
+			return nil
+		end
+		corrected_vertex_id = fallback_vertex_id
+	end
+
+	return corrected_position, corrected_vertex_id
+end
+
+local function is_world_artifact(game_object)
+	if not game_object then
+		return false
+	end
+
+	local call_succeeded, parent_object = pcall(function()
+		return game_object:parent()
+	end)
+	if not call_succeeded or parent_object then
+		return false
+	end
+
+	if type(is_artefact) == "function" then
+		local object_is_artifact
+		call_succeeded, object_is_artifact =
+			pcall(is_artefact, game_object)
+		if call_succeeded and object_is_artifact then
+			return true
+		end
+	end
+
+	if type(IsArtefact) == "function" then
+		local object_is_artifact
+		call_succeeded, object_is_artifact =
+			pcall(IsArtefact, game_object)
+		if call_succeeded and object_is_artifact then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function repair_artifact(game_object, reference_height)
+	if not is_world_artifact(game_object) then
+		return
+	end
+
+	local artifact_position = game_object:position()
+	local position_x, position_y, position_z =
+		get_coordinates(artifact_position)
+	if not position_x then
+		return
+	end
+
+	local surface_height = find_surface_height(
+		position_x,
+		position_z,
+		reference_height
+	)
+	if not surface_height
+		or position_y >= surface_height - SURFACE_HEIGHT_TOLERANCE
+	then
+		return
+	end
+
+	local corrected_height =
+		surface_height + ARTIFACT_HEIGHT_ABOVE_SURFACE
+	local corrected_position = create_valid_level_position(
+		position_x,
+		corrected_height,
+		position_z
+	)
+	if not corrected_position then
+		return
+	end
+
+	local move_succeeded = pcall(function()
+		game_object:force_set_position(corrected_position, true)
+	end)
+	if not move_succeeded then
+		return
+	end
+
+	printf(
+		"[Fix artifact spawning] restored existing [%s:%s] Y %s -> %s",
+		tostring(game_object:section()),
+		tostring(game_object:id()),
+		tostring(position_y),
+		tostring(corrected_height)
+	)
+end
+
+local function is_server_object_on_current_level(server_object)
+	if not server_object then
+		return false
+	end
+
+	local call_succeeded, level_id = pcall(function()
+		local graph_vertex =
+			game_graph():vertex(server_object.m_game_vertex_id)
+		return graph_vertex and graph_vertex:level_id()
+	end)
+	if not call_succeeded or not level_id then
+		return false
+	end
+
+	local object_level_name, current_level_name
+	call_succeeded, object_level_name, current_level_name =
+		pcall(function()
+			return alife():level_name(level_id), level.name()
+		end)
+	return call_succeeded
+		and object_level_name
+		and object_level_name == current_level_name
+end
+
+local function is_server_artifact(server_object)
+	if not server_object then
+		return false
+	end
+
+	local call_succeeded, section, class_id = pcall(function()
+		return server_object:section_name(), server_object:clsid()
+	end)
+	if not call_succeeded or not section then
+		return false
+	end
+
+	local class_is_artifact = false
+	if type(IsArtefact) == "function" then
+		call_succeeded, class_is_artifact =
+			pcall(IsArtefact, nil, class_id)
+		if call_succeeded and not class_is_artifact then
+			return false
+		end
+	end
+
+	if type(is_artefact) == "function" then
+		local section_is_artifact
+		call_succeeded, section_is_artifact =
+			pcall(is_artefact, nil, section)
+		if call_succeeded then
+			return section_is_artifact and true or false
+		end
+	end
+
+	return class_is_artifact
+end
+
+local function is_free_current_level_artifact(server_object)
+	if not server_object then
+		return false
+	end
+
+	local parent_id = server_object.parent_id
+	return (not parent_id or parent_id == FREE_PARENT_ID)
+		and is_server_artifact(server_object)
+		and is_server_object_on_current_level(server_object)
+end
+
+local function move_server_artifact(
+	server_object,
+	corrected_position,
+	corrected_vertex_id
+)
+	local artifact_id = server_object.id
+	local game_vertex_id = server_object.m_game_vertex_id
+	local move_succeeded
+
+	if type(TeleportObject) == "function" then
+		move_succeeded = pcall(
+			TeleportObject,
+			artifact_id,
+			corrected_position,
+			corrected_vertex_id,
+			game_vertex_id
+		)
+	else
+		move_succeeded = pcall(function()
+			alife():teleport_object(
+				artifact_id,
+				game_vertex_id,
+				corrected_vertex_id,
+				corrected_position
+			)
+		end)
+	end
+	if not move_succeeded then
+		return false
+	end
+
+	local game_object = level.object_by_id(artifact_id)
+	if game_object then
+		pcall(function()
+			game_object:force_set_position(corrected_position, true)
+		end)
+	end
+
+	return true
+end
+
+local function repair_unsupported_artifact(server_object)
+	local position_x, position_y, position_z =
+		get_coordinates(get_server_artifact_position(server_object))
+	if not position_x
+		or has_nearby_surface_below(
+			position_x,
+			position_z,
+			position_y
+		)
+	then
+		return
+	end
+
+	local surface_height = find_top_surface_height(
+		position_x,
+		position_z
+	)
+	if not surface_height then
+		printf(
+			"[Fix artifact spawning] unable to restore [%s:%s]: no static surface at X/Z",
+			tostring(server_object:section_name()),
+			tostring(server_object.id)
+		)
+		return false
+	end
+
+	local corrected_height =
+		surface_height + ARTIFACT_HEIGHT_ABOVE_SURFACE
+	if corrected_height
+		<= position_y + SURFACE_HEIGHT_TOLERANCE
+	then
+		printf(
+			"[Fix artifact spawning] unable to restore [%s:%s]: surface Y %s is not above artifact Y %s",
+			tostring(server_object:section_name()),
+			tostring(server_object.id),
+			tostring(surface_height),
+			tostring(position_y)
+		)
+		return false
+	end
+
+	local corrected_position, corrected_vertex_id =
+		create_valid_level_position(
+			position_x,
+			corrected_height,
+			position_z,
+			server_object.m_level_vertex_id
+		)
+	if not corrected_position then
+		printf(
+			"[Fix artifact spawning] unable to restore [%s:%s]: no valid level vertex",
+			tostring(server_object:section_name()),
+			tostring(server_object.id)
+		)
+		return false
+	end
+
+	if not move_server_artifact(
+			server_object,
+			corrected_position,
+			corrected_vertex_id
+		) then
+		printf(
+			"[Fix artifact spawning] unable to restore [%s:%s]: teleport failed",
+			tostring(server_object:section_name()),
+			tostring(server_object.id)
+		)
+		return false
+	end
+
+	printf(
+		"[Fix artifact spawning] restored unsupported [%s:%s] Y %s -> %s",
+		tostring(server_object:section_name()),
+		tostring(server_object.id),
+		tostring(position_y),
+		tostring(corrected_height)
+	)
+	return true
+end
+
+local function repair_unsupported_artifacts(artifact_ids)
+	local checked_artifacts = 0
+	local unsupported_artifacts = 0
+	local moved_artifacts = 0
+
+	for artifact_index = 1, #artifact_ids do
+		local artifact_id = artifact_ids[artifact_index]
+		local server_object = alife_object(artifact_id)
+		if server_object then
+			checked_artifacts = checked_artifacts + 1
+			local repair_result =
+				repair_unsupported_artifact(server_object)
+			if repair_result ~= nil then
+				unsupported_artifacts =
+					unsupported_artifacts + 1
+				if repair_result then
+					moved_artifacts = moved_artifacts + 1
+				end
+			end
+		end
+	end
+
+	printf(
+		"[Fix artifact spawning] stable %s: checked %s world artifacts, unsupported %s, moved %s",
+		STABLE_VERSION,
+		tostring(checked_artifacts),
+		tostring(unsupported_artifacts),
+		tostring(moved_artifacts)
+	)
+end
+
+local function get_parent_zones_by_artifact_id()
+	return bind_anomaly_zone
+		and bind_anomaly_zone.parent_zones_by_artefact_id
+		or {}
+end
+
+local function repair_linked_artifact(game_object, anomaly_binder)
+	local reference_height =
+		get_object_height(anomaly_binder and anomaly_binder.object)
+	if game_object and reference_height then
+		repair_artifact(game_object, reference_height)
+	end
+end
+
+local function repair_level_artifacts(artifact_ids)
+	local parent_zones_by_artifact_id =
+		get_parent_zones_by_artifact_id()
+
+	for artifact_id, anomaly_binder
+		in pairs(parent_zones_by_artifact_id)
+	do
+		local game_object = level.object_by_id(artifact_id)
+		repair_linked_artifact(game_object, anomaly_binder)
+	end
+
+	repair_unsupported_artifacts(artifact_ids)
+end
+
+local function collect_current_level_artifact_ids()
+	local artifact_ids = {}
+	local online_artifact_ids = {}
+
+	for artifact_id = 1, MAX_SERVER_OBJECT_ID do
+		local server_object = alife_object(artifact_id)
+		if is_free_current_level_artifact(server_object) then
+			artifact_ids[#artifact_ids + 1] = artifact_id
+			if level.object_by_id(artifact_id) then
+				online_artifact_ids[#online_artifact_ids + 1] =
+					artifact_id
+			end
+		end
+	end
+
+	return artifact_ids, online_artifact_ids
+end
+
+local function artifact_id_lists_are_equal(
+	first_artifact_ids,
+	second_artifact_ids
+)
+	if not first_artifact_ids
+		or #first_artifact_ids ~= #second_artifact_ids
+	then
+		return false
+	end
+
+	for artifact_index = 1, #first_artifact_ids do
+		if first_artifact_ids[artifact_index]
+			~= second_artifact_ids[artifact_index]
+		then
+			return false
+		end
+	end
+
+	return true
+end
+
+local function get_game_object_identity(game_object)
+	if not game_object then
+		return nil
+	end
+
+	local call_succeeded, object_identity =
+		pcall(tostring, game_object)
+	return call_succeeded and object_identity or nil
+end
+
+local function create_tracked_artifact_states(artifact_ids)
+	local artifact_states = {}
+
+	for artifact_index = 1, #artifact_ids do
+		local artifact_id = artifact_ids[artifact_index]
+		local game_object = level.object_by_id(artifact_id)
+		artifact_states[artifact_id] = {
+			online = game_object and true or false,
+			object_identity = get_game_object_identity(game_object),
+			ready_since = nil,
+			checked = game_object and true or false,
+		}
+	end
+
+	return next(artifact_states) and artifact_states or nil
+end
+
+local function repair_reloaded_artifact(artifact_id)
+	local server_object = alife_object(artifact_id)
+	local game_object = level.object_by_id(artifact_id)
+	if not server_object or not game_object then
+		return false
+	end
+
+	if not is_free_current_level_artifact(server_object) then
+		return false
+	end
+
+	local parent_zones_by_artifact_id =
+		get_parent_zones_by_artifact_id()
+	local anomaly_binder =
+		parent_zones_by_artifact_id[artifact_id]
+	repair_linked_artifact(game_object, anomaly_binder)
+
+	repair_unsupported_artifact(server_object)
+	printf(
+		"[Fix artifact spawning] checked reloaded [%s:%s]",
+		tostring(server_object:section_name()),
+		tostring(artifact_id)
+	)
+	return true
+end
+
+local function mark_tracked_artifact_offline(artifact_state)
+	artifact_state.online = false
+	artifact_state.object_identity = nil
+	artifact_state.ready_since = nil
+	artifact_state.checked = false
+end
+
+local function update_tracked_artifacts(current_time)
+	if not tracked_artifact_states
+		or current_time < tracked_artifact_check_time
+	then
+		return
+	end
+
+	tracked_artifact_check_time =
+		current_time + ARTIFACT_STATE_CHECK_INTERVAL
+	for artifact_id, artifact_state
+		in pairs(tracked_artifact_states)
+	do
+		local server_object = alife_object(artifact_id)
+		if not server_object then
+			tracked_artifact_states[artifact_id] = nil
+		elseif not is_free_current_level_artifact(server_object) then
+			mark_tracked_artifact_offline(artifact_state)
+		else
+			local game_object = level.object_by_id(artifact_id)
+			if not game_object then
+				mark_tracked_artifact_offline(artifact_state)
+			else
+				local object_identity =
+					get_game_object_identity(game_object)
+				local is_new_instance = not artifact_state.online
+					or (
+						object_identity
+						and artifact_state.object_identity
+						and object_identity
+							~= artifact_state.object_identity
+					)
+				if is_new_instance then
+					artifact_state.online = true
+					artifact_state.object_identity = object_identity
+					artifact_state.ready_since = current_time
+					artifact_state.checked = false
+				elseif not artifact_state.checked
+					and current_time
+						>= artifact_state.ready_since
+							+ ARTIFACT_SETTLING_DELAY
+					and repair_reloaded_artifact(artifact_id)
+				then
+					artifact_state.checked = true
+				end
+			end
+		end
+	end
+
+	if not next(tracked_artifact_states) then
+		tracked_artifact_states = nil
+		tracked_artifact_check_time = nil
+	end
+end
+
+local function schedule_artifact_repair()
+	reset_repair_state()
+
+	local current_time = time_global()
+	artifact_repair_time = current_time + ARTIFACT_REPAIR_DELAY
+	artifact_repair_deadline =
+		current_time + ARTIFACT_READINESS_TIMEOUT
+end
+
+local function update_artifact_repair()
+	local current_time = time_global()
+	if not artifact_repair_time then
+		update_tracked_artifacts(current_time)
+		return
+	end
+	if current_time < artifact_repair_time then
+		return
+	end
+
+	local current_artifact_ids, current_online_artifact_ids =
+		collect_current_level_artifact_ids()
+	local artifact_ids_changed =
+		not artifact_id_lists_are_equal(
+			pending_artifact_ids,
+			current_artifact_ids
+		)
+	local online_artifact_ids_changed =
+		not artifact_id_lists_are_equal(
+			pending_online_artifact_ids,
+			current_online_artifact_ids
+		)
+	if artifact_ids_changed or online_artifact_ids_changed then
+		pending_artifact_ids = current_artifact_ids
+		pending_online_artifact_ids =
+			current_online_artifact_ids
+		artifact_ids_stable_since = current_time
+	end
+
+	local artifact_state_is_stable = artifact_ids_stable_since
+		and current_time
+			>= artifact_ids_stable_since
+				+ ARTIFACT_STABILITY_DELAY
+				+ ARTIFACT_SETTLING_DELAY
+	if current_time < artifact_repair_deadline
+		and not artifact_state_is_stable
+	then
+		artifact_repair_time =
+			current_time + ARTIFACT_STATE_CHECK_INTERVAL
+		return
+	end
+
+	local artifact_ids = pending_artifact_ids
+	local artifact_states =
+		create_tracked_artifact_states(artifact_ids)
+	reset_loading_state()
+	tracked_artifact_states = artifact_states
+	tracked_artifact_check_time = artifact_states
+		and current_time + ARTIFACT_STATE_CHECK_INTERVAL
+		or nil
+	repair_level_artifacts(artifact_ids)
+end
+
+function on_game_start()
+	if callbacks_registered then
+		return
+	end
+
+	callbacks_registered = true
+	RegisterScriptCallback(
+		"actor_on_first_update",
+		schedule_artifact_repair
+	)
+	RegisterScriptCallback(
+		"actor_on_update",
+		update_artifact_repair
+	)
+	RegisterScriptCallback(
+		"on_level_changing",
+		reset_repair_state
+	)
+end
