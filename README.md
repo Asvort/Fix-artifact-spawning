@@ -12,6 +12,7 @@
 > ***С фиксом:***
 > <img width="1920" height="1080" alt="С фиксом" src="https://github.com/user-attachments/assets/df6d8ad7-b295-4f30-9acf-5d57efe91cb9" />
 > <img width="1920" height="1080" alt="С фиксом" src="https://github.com/user-attachments/assets/23c13fc2-119c-4655-92cf-73f6bf6fec89" />
+> <img width="1920" height="1080" alt="Проверка подземных артефактов с фиксом" src="https://github.com/user-attachments/assets/9af44b2e-8582-42d1-b568-ee5fec62da17" />
 </details>
 
 ## [🖥️] Tested || Протестирован
